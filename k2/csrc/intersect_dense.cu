@@ -97,7 +97,7 @@ using namespace intersect_dense_internal;  // NOLINT
        Call Intersect()
        Call FormatOutput()
 */
-class MultiGraphDenseIntersect {
+class MultiGraphDenseIntersectFactorized {
  public:
   /**
      Intersection (a.k.a. composition) that corresponds to decoding for
@@ -121,15 +121,24 @@ class MultiGraphDenseIntersect {
                            not on a path within `output_beam` of the best path
                            will not be retained.
    */
-  MultiGraphDenseIntersect(FsaVec &a_fsas, DenseFsaVec &b_fsas,
+  MultiGraphDenseIntersectFactorized(FsaVec &a_fsas, DenseFsaVec &b_fsas,
                            const Array1<int32_t> &a_to_b_map,
                            float output_beam, int32_t max_states,
-                           int32_t max_arcs)
+                           int32_t max_arcs,
+                           const Array2<float> *speaker_scores = nullptr,
+                           int32_t token_vocab_size = 0)
       : a_fsas_(a_fsas), b_fsas_(b_fsas), a_to_b_map_(a_to_b_map),
         output_beam_(output_beam), max_states_(max_states),
-        max_arcs_(max_arcs) {
+        max_arcs_(max_arcs), speaker_scores_(speaker_scores),
+        token_vocab_size_(token_vocab_size) {
     NVTX_RANGE(K2_FUNC);
     c_ = GetContext(a_fsas.shape, b_fsas.shape, a_to_b_map);
+    if (speaker_scores_ != nullptr) {
+      K2_CHECK(c_->IsCompatible(*speaker_scores_->Context()));
+      K2_CHECK_EQ(speaker_scores_->Dim0(), b_fsas_.scores.Dim0());
+      K2_CHECK_EQ(b_fsas_.scores.Dim1(), token_vocab_size_ + 1);
+      K2_CHECK_GT(speaker_scores_->Dim1(), 1);
+    }
 
     K2_CHECK_EQ(a_fsas_.Dim0(), a_to_b_map.Dim());
     num_fsas_ = a_fsas_.Dim0();
@@ -224,7 +233,8 @@ class MultiGraphDenseIntersect {
                   those properties.
    */
   FsaVec FormatOutput(Array1<int32_t> *arc_map_a,
-                      Array1<int32_t> *arc_map_b) {
+                      Array1<int32_t> *arc_map_b,
+                      Array1<int32_t> *arc_map_speaker = nullptr) {
     NVTX_RANGE(K2_FUNC);
 
     Array1<float> score_cutoffs;
@@ -403,6 +413,11 @@ class MultiGraphDenseIntersect {
     CompressedArc *carcs_data = carcs_.Data();
     int32_t scores_stride = b_fsas_.scores.ElemStride0();
     const float *scores_data = b_fsas_.scores.Data();
+    const float *speaker_scores_data =
+        speaker_scores_ == nullptr ? nullptr : speaker_scores_->Data();
+    int32_t speaker_stride =
+        speaker_scores_ == nullptr ? 0 : speaker_scores_->ElemStride0();
+    int32_t token_vocab_size = token_vocab_size_;
 
     auto lambda_set_keep = [=] __host__ __device__(
         int32_t arc_idx0123, int32_t ans_state_idx012) -> bool {
@@ -423,9 +438,19 @@ class MultiGraphDenseIntersect {
           CompressedArc carc = carcs_data[a_fsas_arc_idx012];
           K2_CHECK_EQ(a_fsas_state_idx1, (int32_t)carc.src_state);
           int32_t a_fsas_dest_state_idx1 = carc.dest_state;
-          int32_t scores_index = fsa_info.scores_offset +
-                                 (scores_stride * t_idx1) + carc.label_plus_one;
+          int32_t row_offset = fsa_info.scores_offset / scores_stride + t_idx1;
+          int32_t token_col = carc.label_plus_one;
+          int32_t speaker_col = 0;
+          if (speaker_scores_data != nullptr && carc.label_plus_one > 1) {
+            int32_t joint_label = carc.label_plus_one - 1;
+            token_col = 2 + (joint_label - 1) % (token_vocab_size - 1);
+            speaker_col = 1 + (joint_label - 1) / (token_vocab_size - 1);
+          }
+          int32_t scores_index = row_offset * scores_stride + token_col;
           float arc_score = carc.score + scores_data[scores_index];
+          if (speaker_scores_data != nullptr)
+            arc_score += speaker_scores_data[row_offset * speaker_stride +
+                                             speaker_col];
 
           // unpruned_src_state_idx and unpruned_dest_state_idx are into
           // `renumber_states.Keep()` or `renumber_states.Old2New()`
@@ -489,7 +514,8 @@ class MultiGraphDenseIntersect {
     const int32_t *arcs_new2old_data = arcs_new2old.Data(),
        *ans_row_ids3_subsampled_data = ans_row_ids3_subsampled.Data();
     int32_t *arc_map_a_data = nullptr,
-            *arc_map_b_data = nullptr;
+            *arc_map_b_data = nullptr,
+            *arc_map_speaker_data = nullptr;
 
     if (arc_map_a) {
       *arc_map_a = Array1<int32_t>(c_, num_arcs_out);
@@ -498,6 +524,10 @@ class MultiGraphDenseIntersect {
     if (arc_map_b) {
       *arc_map_b = Array1<int32_t>(c_, num_arcs_out);
       arc_map_b_data = arc_map_b->Data();
+    }
+    if (arc_map_speaker) {
+      *arc_map_speaker = Array1<int32_t>(c_, num_arcs_out);
+      arc_map_speaker_data = arc_map_speaker->Data();
     }
 
     K2_EVAL(
@@ -528,13 +558,27 @@ class MultiGraphDenseIntersect {
           if (arc_map_a_data) {
             arc_map_a_data[arc_idx_out] = a_fsas_arc_idx012;
           }
-          int32_t scores_index = fsa_info.scores_offset +
-                                 (scores_stride * t_idx1) + carc.label_plus_one;
+          int32_t row_offset = fsa_info.scores_offset / scores_stride + t_idx1;
+          int32_t token_col = carc.label_plus_one;
+          int32_t speaker_col = 0;
+          if (speaker_scores_data != nullptr && carc.label_plus_one > 1) {
+            int32_t joint_label = carc.label_plus_one - 1;
+            token_col = 2 + (joint_label - 1) % (token_vocab_size - 1);
+            speaker_col = 1 + (joint_label - 1) / (token_vocab_size - 1);
+          }
+          int32_t scores_index = row_offset * scores_stride + token_col;
           if (arc_map_b_data) {
             arc_map_b_data[arc_idx_out] = scores_index;
           }
+          if (arc_map_speaker_data) {
+            arc_map_speaker_data[arc_idx_out] =
+                row_offset * speaker_stride + speaker_col;
+          }
 
           float arc_score = carc.score + scores_data[scores_index];
+          if (speaker_scores_data != nullptr)
+            arc_score += speaker_scores_data[row_offset * speaker_stride +
+                                             speaker_col];
 
           // unpruned_src_state_idx and unpruned_dest_state_idx are into
           // `renumber_states.Keep()` or `renumber_states.Old2New()`
@@ -793,6 +837,13 @@ class MultiGraphDenseIntersect {
     FsaInfo *fsa_info_data = fsa_info_.Data();
     float *scores_data = b_fsas_.scores.Data();
     int32_t scores_stride = b_fsas_.scores.ElemStride0();
+    const float *speaker_scores_data =
+        speaker_scores_ == nullptr ? nullptr : speaker_scores_->Data();
+    int32_t speaker_stride =
+        speaker_scores_ == nullptr ? 0 : speaker_scores_->ElemStride0();
+    int32_t num_speakers =
+        speaker_scores_ == nullptr ? 0 : speaker_scores_->Dim1() - 1;
+    int32_t token_vocab_size = token_vocab_size_;
 
     K2_EVAL(
         c_, num_arcs, lambda_set_arc_scores, (int32_t arc_idx012)->void {
@@ -819,13 +870,29 @@ class MultiGraphDenseIntersect {
           // graph (a_fsas) does not exist in the neural-net output (b_fsas).
           float b_score_forward;
           float b_score_backward;
-          if (carc.label_plus_one <= scores_num_cols) {
-            b_score_forward = scores_data[fsa_info.scores_offset +
-                                          (scores_stride * (t - 1)) +
-                                          carc.label_plus_one];
-            b_score_backward = scores_data[fsa_info.scores_offset +
-                                           (scores_stride * (fsa_info.T - t)) +
-                                           carc.label_plus_one];
+          int32_t token_col = carc.label_plus_one, speaker_col = 0;
+          bool label_valid;
+          if (speaker_scores_data != nullptr && carc.label_plus_one > 1) {
+            int32_t joint_label = carc.label_plus_one - 1;
+            token_col = 2 + (joint_label - 1) % (token_vocab_size - 1);
+            speaker_col = 1 + (joint_label - 1) / (token_vocab_size - 1);
+            label_valid = token_col <= token_vocab_size &&
+                          speaker_col <= num_speakers;
+          } else {
+            label_valid = carc.label_plus_one < scores_num_cols;
+          }
+          if (label_valid) {
+            int32_t forward_row = fsa_info.scores_offset / scores_stride + t - 1;
+            int32_t backward_row = fsa_info.scores_offset / scores_stride +
+                                   fsa_info.T - t;
+            b_score_forward = scores_data[forward_row * scores_stride + token_col];
+            b_score_backward = scores_data[backward_row * scores_stride + token_col];
+            if (speaker_scores_data != nullptr) {
+              b_score_forward += speaker_scores_data[
+                  forward_row * speaker_stride + speaker_col];
+              b_score_backward += speaker_scores_data[
+                  backward_row * speaker_stride + speaker_col];
+            }
           } else {
             b_score_forward = minus_inf;
             b_score_backward = minus_inf;
@@ -1040,8 +1107,11 @@ class MultiGraphDenseIntersect {
 
   int32_t max_states_;  // number of max states to avoid out-of-memory
   int32_t max_arcs_;    // number of max arcs to avoid out-of-memory
+  const Array2<float> *speaker_scores_;
+  int32_t token_vocab_size_;
 };
 
+#ifndef K2_FACTOR_EXT_ONLY
 void IntersectDense(FsaVec &a_fsas, DenseFsaVec &b_fsas,
                     const Array1<int32_t> *a_to_b_map,
                     float output_beam, int32_t max_states, int32_t max_arcs,
@@ -1061,7 +1131,7 @@ void IntersectDense(FsaVec &a_fsas, DenseFsaVec &b_fsas,
   }
   K2_CHECK_EQ(a_fsas.Dim0(), a_to_b_map->Dim());
 
-  MultiGraphDenseIntersect intersector(a_fsas, b_fsas,
+  MultiGraphDenseIntersectFactorized intersector(a_fsas, b_fsas,
                                        *a_to_b_map,
                                        output_beam,
                                        max_states,
@@ -1069,6 +1139,36 @@ void IntersectDense(FsaVec &a_fsas, DenseFsaVec &b_fsas,
 
   intersector.Intersect();
   FsaVec ret = intersector.FormatOutput(arc_map_a, arc_map_b);
+  *out = std::move(ret);
+}
+#endif
+
+void IntersectDenseFactorized(
+    FsaVec &a_fsas, DenseFsaVec &token_fsas,
+    const Array2<float> &speaker_scores, int32_t token_vocab_size,
+    const Array1<int32_t> *a_to_b_map, float output_beam,
+    int32_t max_states, int32_t max_arcs, FsaVec *out,
+    Array1<int32_t> *arc_map_a, Array1<int32_t> *arc_map_token,
+    Array1<int32_t> *arc_map_speaker) {
+  NVTX_RANGE("IntersectDenseFactorized");
+  Array1<int32_t> temp;
+  K2_CHECK_EQ(a_fsas.NumAxes(), 3);
+  if (a_to_b_map == nullptr) {
+    K2_CHECK_EQ(a_fsas.Dim0(), token_fsas.shape.Dim0());
+    temp = Arange(a_fsas.Context(), 0, a_fsas.Dim0());
+    a_to_b_map = &temp;
+  } else {
+    K2_CHECK(IsMonotonic(*a_to_b_map));
+  }
+  K2_CHECK_EQ(a_fsas.Dim0(), a_to_b_map->Dim());
+  K2_CHECK_GT(token_vocab_size, 1);
+
+  MultiGraphDenseIntersectFactorized intersector(
+      a_fsas, token_fsas, *a_to_b_map, output_beam, max_states, max_arcs,
+      &speaker_scores, token_vocab_size);
+  intersector.Intersect();
+  FsaVec ret = intersector.FormatOutput(
+      arc_map_a, arc_map_token, arc_map_speaker);
   *out = std::move(ret);
 }
 }  // namespace k2

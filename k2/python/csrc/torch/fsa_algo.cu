@@ -250,6 +250,41 @@ static void PybindIntersectDense(py::module &m) {
       py::arg("a_fsas"), py::arg("b_fsas"), py::arg("a_to_b_map"),
       py::arg("output_beam"), py::arg("max_states") = 15000000,
       py::arg("max_arcs") = 1073741824 /* 2^30 */);
+
+  m.def(
+      "intersect_dense_factorized",
+      [](FsaVec &a_fsas, DenseFsaVec &token_fsas,
+         torch::Tensor speaker_scores, int32_t token_vocab_size,
+         torch::optional<torch::Tensor> a_to_b_map, float output_beam,
+         int32_t max_states, int32_t max_arcs)
+          -> std::tuple<FsaVec, torch::Tensor, torch::Tensor, torch::Tensor> {
+        DeviceGuard guard(a_fsas.Context());
+        K2_CHECK_EQ(speaker_scores.scalar_type(), torch::kFloat32);
+        K2_CHECK_EQ(speaker_scores.dim(), 2);
+        K2_CHECK(speaker_scores.is_contiguous());
+        Array2<float> speaker_scores_array =
+            FromTorch<float>(speaker_scores, Array2Tag{});
+        Array1<int32_t> arc_map_a, arc_map_token, arc_map_speaker;
+        FsaVec out;
+        FsaVec a_fsa_vec = FsaToFsaVec(a_fsas);
+        Array1<int32_t> a_to_b_map_array;
+        if (a_to_b_map.has_value()) {
+          a_to_b_map_array = FromTorch<int32_t>(a_to_b_map.value());
+        } else {
+          a_to_b_map_array = Arange(a_fsa_vec.Context(), 0, a_fsa_vec.Dim0());
+        }
+        IntersectDenseFactorized(
+            a_fsa_vec, token_fsas, speaker_scores_array, token_vocab_size,
+            &a_to_b_map_array, output_beam, max_states, max_arcs, &out,
+            &arc_map_a, &arc_map_token, &arc_map_speaker);
+        return std::make_tuple(out, ToTorch(arc_map_a),
+                               ToTorch(arc_map_token),
+                               ToTorch(arc_map_speaker));
+      },
+      py::arg("a_fsas"), py::arg("token_fsas"), py::arg("speaker_scores"),
+      py::arg("token_vocab_size"), py::arg("a_to_b_map"),
+      py::arg("output_beam"), py::arg("max_states") = 15000000,
+      py::arg("max_arcs") = 1073741824);
 }
 
 static void PybindConnect(py::module &m) {

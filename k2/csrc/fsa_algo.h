@@ -259,6 +259,17 @@ void IntersectDense(FsaVec &a_fsas, DenseFsaVec &b_fsas,
                     FsaVec *out, Array1<int32_t> *arc_map_a,
                     Array1<int32_t> *arc_map_b);
 
+// As IntersectDense, but nonblank acoustic scores are factorized as
+// token_scores[token] + speaker_scores[speaker].  Joint graph labels use
+// label = token + speaker * (token_vocab_size - 1), with label 0 blank.
+void IntersectDenseFactorized(
+    FsaVec &a_fsas, DenseFsaVec &token_fsas,
+    const Array2<float> &speaker_scores, int32_t token_vocab_size,
+    const Array1<int32_t> *a_to_b_map, float output_beam,
+    int32_t max_states, int32_t max_arcs, FsaVec *out,
+    Array1<int32_t> *arc_map_a, Array1<int32_t> *arc_map_token,
+    Array1<int32_t> *arc_map_speaker);
+
 /*
   This is 'normal' intersection for CPU (we would call this Compose() for FSTs,
   but you can do that using Intersect(), by calling this and then Invert() (or
